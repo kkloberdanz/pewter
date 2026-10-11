@@ -1,0 +1,20 @@
+.{
+    .name = .pewter,
+    .version = "0.1.0",
+    .fingerprint = 0xe8a383041ede47a6, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        // Only used by `zig build -Dtls`; never fetched otherwise.
+        .libressl = .{
+            .url = "git+https://github.com/allyourcodebase/libressl#8c63fadf71925d74942a847b9a6b3a28930792a3",
+            .hash = "libressl-4.0.0--kqV4FHUAABdqKrbT3i3K-m1m7s_HyZZMMoBpbHjCiNQ",
+            .lazy = true,
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "pewter.c",
+        "README.md",
+    },
+}
