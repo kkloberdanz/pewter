@@ -30,6 +30,7 @@
 
 #include <sys/types.h>
 #include <sys/param.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -58,6 +59,11 @@
 #  include <sys/prctl.h>
 #endif
 
+#if defined(__FreeBSD__)
+#  include <sys/capsicum.h>
+#  include <sys/procctl.h>
+#endif
+
 #if defined(PEWTER_TLS)
 #  include <openssl/ssl.h>
 #  include <openssl/err.h>
@@ -67,13 +73,21 @@
 #if defined(__GNUC__)
 #  define PRINTF_LIKE(f, a) __attribute__((format(printf, f, a)))
 #  define NORETURN          __attribute__((noreturn))
+#  define EXTENSION         __extension__  /* exempt one expression from
+                                              -pedantic, e.g. a system
+                                              macro using long long */
 #else
 #  define PRINTF_LIKE(f, a)
 #  define NORETURN
+#  define EXTENSION
 #endif
 
 #ifndef O_CLOEXEC
 #  define O_CLOEXEC 0
+#endif
+
+#ifndef O_DIRECTORY
+#  define O_DIRECTORY 0
 #endif
 
 #ifndef PATH_MAX
@@ -105,10 +119,12 @@
 #define LOG_TARGET_LEN 256           /* request target as logged           */
 #define LOG_METHOD_LEN 32            /* request method as logged           */
 #define LOG_LINE_LEN   (PATH_MAX + 512) /* one log line, emitted whole     */
+#define CHILD_MAX_FDS  16            /* RLIMIT_NOFILE in each child        */
 
 static volatile sig_atomic_t g_active_children = 0;
 static volatile sig_atomic_t g_quit = 0;
 static int g_timeout = DEFAULT_TIMEOUT;
+static int g_rootfd = -1;       /* the chroot's "/"; children open through it */
 
 /* A client connection: the socket, plus the TLS session when HTTPS is on.
    All request and response I/O goes through conn_read/conn_write_all so
@@ -1177,6 +1193,14 @@ static void tls_close(struct conn *c)
 /* Request handling                                                    */
 /* ------------------------------------------------------------------ */
 
+/* A sanitized path is absolute ("/a/b").  Children look it up relative to
+   g_rootfd, the chroot's root, because a Capsicum sandbox refuses absolute
+   paths; "/" itself becomes ".". */
+static const char *rel_path(const char *path)
+{
+    return path[1] != '\0' ? path + 1 : ".";
+}
+
 static void handle_client(int cfd, const struct sockaddr_storage *ss)
 {
     struct conn c;
@@ -1244,17 +1268,23 @@ static void handle_client(int cfd, const struct sockaddr_storage *ss)
         /* O_NONBLOCK so a FIFO in the document root cannot park the child
            in open() until the alarm fires; it is cleared again below once
            the file is known to be regular. */
-        fd = open(fspath, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+        fd = openat(g_rootfd, rel_path(fspath),
+                    O_RDONLY | O_CLOEXEC | O_NONBLOCK);
         if (fd < 0) {
             if (errno == ENOENT || errno == ENOTDIR) {
                 struct stat ds;
                 status = 404;
                 /* "/dir/" whose index.html is missing: the directory
                    exists but we refuse to list it. */
-                if (trailing && stat(clean, &ds) == 0 && S_ISDIR(ds.st_mode))
+                if (trailing && fstatat(g_rootfd, rel_path(clean), &ds, 0) == 0
+                    && S_ISDIR(ds.st_mode))
                     status = 403;
             } else if (errno == EACCES) {
                 status = 403;
+#if defined(ENOTCAPABLE)
+            } else if (errno == ENOTCAPABLE) {
+                status = 403;      /* a symlink leading out of the sandbox */
+#endif
             } else if (errno == ENAMETOOLONG) {
                 status = 414;      /* a segment longer than NAME_MAX */
             } else {
@@ -1441,6 +1471,25 @@ static void enter_chroot(const char *docroot)
         fatal("chroot(%s): %s", docroot, strerror(errno));
     if (chdir("/") != 0)
         fatal("chdir(/) after chroot: %s", strerror(errno));
+
+    /* Children inherit this descriptor and open every file through it
+       with openat(2), which is all a Capsicum sandbox allows. */
+    g_rootfd = open(".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (g_rootfd < 0)
+        fatal("open(/) after chroot: %s", strerror(errno));
+#if defined(__FreeBSD__)
+    {
+        /* Files opened through a capability inherit its rights, so this
+           also limits every file a child serves: look up, read, seek,
+           stat and set O_NONBLOCK.  Nothing that writes or creates. */
+        cap_rights_t rights;
+        /* The CAP_ constants are unsigned long long, not C89. */
+        EXTENSION cap_rights_init(&rights, CAP_LOOKUP, CAP_PREAD, CAP_FSTAT,
+                                  CAP_FSTATAT, CAP_FCNTL);
+        if (cap_rights_limit(g_rootfd, &rights) != 0)
+            fatal("cap_rights_limit: %s", strerror(errno));
+    }
+#endif
 }
 
 static void drop_privileges(uid_t uid, gid_t gid)
@@ -1462,6 +1511,56 @@ static void drop_privileges(uid_t uid, gid_t gid)
 #if defined(__linux__) && defined(PR_SET_NO_NEW_PRIVS)
     (void)prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
 #endif
+#if defined(__FreeBSD__)
+    {
+        int arg;
+#  if defined(PROC_NO_NEW_PRIVS_CTL)       /* FreeBSD 14 and later */
+        arg = PROC_NO_NEW_PRIVS_ENABLE;
+        (void)procctl(P_PID, getpid(), PROC_NO_NEW_PRIVS_CTL, &arg);
+#  endif
+        /* No ptrace(2) attach and no core dumps, for this process and every
+           child it forks: each of them holds the TLS private key.  The
+           kernel already refuses both for a process that changed its
+           credentials; this does not depend on that. */
+        arg = PROC_TRACE_CTL_DISABLE;
+        (void)procctl(P_PID, getpid(), PROC_TRACE_CTL, &arg);
+    }
+#endif
+}
+
+/* Shrink what a child could do if serving its request were ever subverted.
+   Runs right after fork, before the first byte from the client is read
+   (the TLS handshake included).  A failure here fails closed: the child
+   exits without serving. */
+static void sandbox_child(void)
+{
+    struct rlimit none, fds;
+    const char *what = NULL;
+
+    none.rlim_cur = none.rlim_max = 0;
+    fds.rlim_cur = fds.rlim_max = CHILD_MAX_FDS;
+
+    /* No core file can ever hold the TLS private key. */
+    if (setrlimit(RLIMIT_CORE, &none) != 0)
+        what = "RLIMIT_CORE";
+    /* A child serves one request and exits; it never needs to fork. */
+    else if (setrlimit(RLIMIT_NPROC, &none) != 0)
+        what = "RLIMIT_NPROC";
+    /* stdio, the client socket, g_rootfd and the file being served. */
+    else if (setrlimit(RLIMIT_NOFILE, &fds) != 0)
+        what = "RLIMIT_NOFILE";
+#if defined(__FreeBSD__)
+    /* Capability mode: from here on only the descriptors already held can
+       be used.  No new sockets or connections, no signals to other
+       processes, no path lookups except beneath g_rootfd. */
+    else if (cap_enter() != 0)
+        what = "cap_enter";
+#endif
+
+    if (what != NULL) {
+        logmsg("child sandbox: %s: %s", what, strerror(errno));
+        _exit(1);
+    }
 }
 
 /* Turn away a connection the parent will not fork for.  In the clear the
@@ -1626,6 +1725,7 @@ int main(int argc, char **argv)
             set_handler(SIGTERM, SIG_DFL, 0);
             set_handler(SIGINT, SIG_DFL, 0);
             close(lfd);
+            sandbox_child();
             handle_client(cfd, &ss);
             _exit(0);
         }

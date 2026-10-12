@@ -252,13 +252,24 @@ Startup, in this order, all before the first `accept()`:
 3. Bind and listen (this is what needs root for ports below 1024).
 4. `chdir(docroot)`, then `chroot(".")`, then `chdir("/")`. Chrooting to the
    directory we are already in means there is no path re-resolution between
-   check and use.
+   check and use. Then `/` is opened as a directory descriptor; children
+   open every file relative to it with `openat(2)`. On FreeBSD its Capsicum
+   rights are limited to lookup, read, seek, stat and `fcntl`, and every
+   file opened through it inherits those limits.
 5. `setgroups`, `setgid`, `setuid`, then verify: `setuid(0)` and `setgid(0)`
    must fail and the real/effective ids must match. On Linux,
-   `PR_SET_NO_NEW_PRIVS` is also set.
+   `PR_SET_NO_NEW_PRIVS` is also set. On FreeBSD, `procctl(2)` sets the
+   equivalent no-new-privileges flag (14.0 and later) and disables
+   `ptrace` attach and core dumps for the server and every child.
 
 Per request, in a forked child:
 
+- Before anything is read from the client, TLS handshake included, the
+  child sets `RLIMIT_CORE` and `RLIMIT_NPROC` to 0 (no core files, no
+  forking) and `RLIMIT_NOFILE` to 16. On FreeBSD it then enters Capsicum
+  capability mode with `cap_enter(2)`: no new sockets or connections, no
+  signals to other processes, no path lookups except beneath the root
+  descriptor. If any step fails the child exits without serving.
 - `alarm(timeout)` bounds the child's entire life; `SIGALRM` kills it.
   `SO_RCVTIMEO`/`SO_SNDTIMEO` are set as well.
 - The request head is read into a fixed 8 KiB stack buffer. An over-long
@@ -318,7 +329,9 @@ Consequences to know about:
 
 - The private key lives in the memory of every child, which runs as
   `nobody` inside the chroot. That is the same exposure nginx or Apache
-  workers have; a compromise of a child process exposes the key.
+  workers have; a compromise of a child process exposes the key. On
+  FreeBSD, Capsicum leaves such a child no way to open a connection to
+  send it anywhere except the client's own socket.
 - A client that sends plain HTTP to the HTTPS port gets a plain-text
   `400 Bad Request` and a close, so the mistake is visible rather than a
   hang. The child peeks at the first byte before starting the handshake:
@@ -341,6 +354,9 @@ and restart to pick up a renewal). A reverse proxy (nginx, Caddy, haproxy)
 remains a fine way to add any of those in front of the plain-HTTP build.
 
 Symlinks inside the document root are followed; they cannot escape the chroot.
+On FreeBSD, Capsicum also resolves them beneath the document root, so a
+symlink with an absolute target, or one that climbs above the root, answers
+403 there; use relative targets.
 
 ## sendfile
 
