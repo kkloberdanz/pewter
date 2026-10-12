@@ -230,6 +230,14 @@ executions per second. It needs clang with the libFuzzer runtime (Debian:
     sh test.sh ./pewter-debug && python3 conformance.py --tls ./pewter-debug \
         && python3 fuzz.py --tls ./pewter-debug
 
+The sanitizer builds have no seccomp filter, so finish with the release
+builds, which do:
+
+    make && sh test.sh ./pewter && python3 conformance.py ./pewter \
+        && python3 fuzz.py ./pewter
+    make tls && sh test.sh ./pewter && python3 conformance.py --tls ./pewter \
+        && python3 fuzz.py --tls ./pewter
+
 `detect_leaks=0` is required: LeakSanitizer reads `/proc` at exit, which does
 not exist inside the chroot. The server never allocates on the request path
 anyway. `slowhttptest -H/-B/-R/-X` and nikto have also been run against the
@@ -269,7 +277,20 @@ Per request, in a forked child:
   forking) and `RLIMIT_NOFILE` to 16. On FreeBSD it then enters Capsicum
   capability mode with `cap_enter(2)`: no new sockets or connections, no
   signals to other processes, no path lookups except beneath the root
-  descriptor. If any step fails the child exits without serving.
+  descriptor. On Linux (x86_64 and aarch64) it instead installs a seccomp
+  filter: an allowlist of the system calls a child needs, with anything
+  else killing it. There is no `socket`, `connect`, `execve`, `fork` or
+  `ptrace`; `openat` only without write, create, truncate or append
+  flags; `mmap` and `mprotect` only without `PROT_EXEC`; and `tgkill` only
+  on the child itself, so it cannot signal the parent or its siblings.
+  Paths need no filtering: the chroot confines them. If any step fails
+  the child exits without serving.
+- A child killed by the filter shows up as a connection closed without a
+  response. On kernels built with audit support (most distributions) the
+  kernel log records the system call (`dmesg | grep
+  seccomp`). The sanitizer builds (`make debug`, `make debug-tls`) leave
+  the filter out, because the sanitizer runtimes make system calls of
+  their own; run the suites on the release build too to exercise it.
 - `alarm(timeout)` bounds the child's entire life; `SIGALRM` kills it.
   `SO_RCVTIMEO`/`SO_SNDTIMEO` are set as well.
 - The request head is read into a fixed 8 KiB stack buffer. An over-long
@@ -330,8 +351,9 @@ Consequences to know about:
 - The private key lives in the memory of every child, which runs as
   `nobody` inside the chroot. That is the same exposure nginx or Apache
   workers have; a compromise of a child process exposes the key. On
-  FreeBSD, Capsicum leaves such a child no way to open a connection to
-  send it anywhere except the client's own socket.
+  FreeBSD Capsicum, and on Linux the seccomp filter, leave such a child
+  no way to open a connection to send it anywhere except the client's
+  own socket.
 - A client that sends plain HTTP to the HTTPS port gets a plain-text
   `400 Bad Request` and a close, so the mistake is visible rather than a
   hang. The child peeks at the first byte before starting the handshake:

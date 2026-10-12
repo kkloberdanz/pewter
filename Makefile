@@ -52,7 +52,11 @@ PIE      = $$(d=$$(mktemp -d) && printf 'int main(void){return 0;}\n' >"$$d/p.c"
            && echo -pie; rm -rf "$$d")
 
 DEBUG_OPT    = -O0 -g3
-DEBUG_HARDEN = -fsanitize=address,undefined -fno-omit-frame-pointer
+# Sanitizer runtimes make system calls of their own, so the debug build
+# leaves out the Linux seccomp filter; run the suites on the release build
+# too to exercise it.
+DEBUG_HARDEN = -fsanitize=address,undefined -fno-omit-frame-pointer \
+               -DPEWTER_NO_SECCOMP
 DEBUG_LD     = -fsanitize=address,undefined
 
 # HTTPS build.  The $$(...) substitutions run in the shell when the tls

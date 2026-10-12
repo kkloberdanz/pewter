@@ -99,6 +99,24 @@
 #  define PEWTER_HAVE_SENDFILE 1
 #endif
 
+/* Linux children run under a seccomp syscall allowlist, on the
+   architectures the filter is written for.  Sanitizer builds define
+   PEWTER_NO_SECCOMP: their runtimes make system calls of their own, and a
+   killed child would hide the report the build exists to produce. */
+#if defined(__linux__) && !defined(PEWTER_NO_SECCOMP) && \
+    (defined(__x86_64__) || defined(__aarch64__))
+#  define PEWTER_HAVE_SECCOMP 1
+#  include <stddef.h>
+#  include <sys/mman.h>
+#  include <sys/syscall.h>
+#  include <linux/audit.h>
+#  include <linux/filter.h>
+#  include <linux/seccomp.h>
+#  ifndef SECCOMP_RET_KILL_PROCESS
+#    define SECCOMP_RET_KILL_PROCESS 0x80000000U   /* Linux 4.14 */
+#  endif
+#endif
+
 /* ------------------------------------------------------------------ */
 /* Configuration                                                       */
 /* ------------------------------------------------------------------ */
@@ -1528,6 +1546,152 @@ static void drop_privileges(uid_t uid, gid_t gid)
 #endif
 }
 
+#if defined(PEWTER_HAVE_SECCOMP)
+/* ------------------------------------------------------------------ */
+/* Linux: seccomp filter for the children                              */
+/* ------------------------------------------------------------------ */
+
+/* What a child may still do once chrooted and unprivileged, as a list of
+   system calls; anything else kills it.  Chroot already confines paths,
+   which seccomp cannot inspect, so the filter's job is the rest: no new
+   sockets or connections, no signals to other processes, no exec, no
+   ptrace, nothing opened for writing, no executable memory, and far less
+   of the kernel within reach. */
+
+#if defined(__x86_64__)
+#  define SC_AUDIT_ARCH AUDIT_ARCH_X86_64
+#elif defined(__aarch64__)
+#  define SC_AUDIT_ARCH AUDIT_ARCH_AARCH64
+#endif
+
+#define SC_MAX_INSNS 256             /* about 115 used on x86_64 */
+/* Low 32 bits of syscall argument i; both architectures are little-endian.
+   Every argument checked below is an int, of which the kernel uses only
+   those bits. */
+#define SC_ARG_LO(i) (offsetof(struct seccomp_data, args) + (i) * 8)
+/* openat/open flags that could create, truncate or write a file. */
+#define SC_WRITE_FLAGS (O_ACCMODE | O_CREAT | O_TRUNC | O_APPEND)
+
+/* Allowed unconditionally. */
+static const long sc_allowed[] = {
+    /* I/O on descriptors the child already holds.  sendto is send(); with
+       no socket() a destination address has nowhere to go.  writev is
+       glibc's "stack smashing detected" message. */
+    __NR_read, __NR_write, __NR_writev, __NR_pread64, __NR_lseek,
+    __NR_recvfrom, __NR_sendto, __NR_sendfile, __NR_setsockopt,
+    __NR_shutdown, __NR_fcntl, __NR_close,
+    /* fstat, and fstatat beneath the root; libcs differ in which they use */
+    __NR_fstat, __NR_newfstatat, __NR_statx,
+    /* memory for malloc in libc and the TLS library (mmap and mprotect
+       are allowed below, without PROT_EXEC) */
+    __NR_brk, __NR_munmap, __NR_mremap, __NR_madvise, __NR_futex,
+    /* time, the per-child alarm (setitimer on aarch64 and in musl),
+       randomness for TLS */
+    __NR_clock_gettime, __NR_gettimeofday, __NR_setitimer, __NR_getrandom,
+    /* own identity, abort(), exit */
+    __NR_getpid, __NR_gettid, __NR_rt_sigprocmask, __NR_rt_sigreturn,
+    __NR_restart_syscall, __NR_exit, __NR_exit_group,
+#if defined(__x86_64__)
+    __NR_alarm, __NR_time,     /* not in the aarch64 syscall table */
+#endif
+    -1
+};
+
+struct sc_prog {
+    struct sock_filter insn[SC_MAX_INSNS];
+    unsigned short n;
+    int overflow;
+};
+
+static void sc_emit(struct sc_prog *p, unsigned int code, unsigned int jt,
+                    unsigned int jf, unsigned long k)
+{
+    struct sock_filter *f;
+    if (p->n >= SC_MAX_INSNS) {
+        p->overflow = 1;
+        return;
+    }
+    f = &p->insn[p->n++];
+    f->code = (__u16)code;
+    f->jt = (__u8)jt;
+    f->jf = (__u8)jf;
+    f->k = (__u32)k;
+}
+
+/* With the syscall number in the accumulator: allow syscall nr. */
+static void sc_allow(struct sc_prog *p, long nr)
+{
+    sc_emit(p, BPF_JMP | BPF_JEQ | BPF_K, 0, 1, (unsigned long)nr);
+    sc_emit(p, BPF_RET | BPF_K, 0, 0, SECCOMP_RET_ALLOW);
+}
+
+/* Allow syscall nr only if (argument arg & mask) == want, else kill.  A
+   different syscall jumps over the block with the number still loaded. */
+static void sc_allow_if(struct sc_prog *p, long nr, unsigned int arg,
+                        unsigned long mask, unsigned long want)
+{
+    sc_emit(p, BPF_JMP | BPF_JEQ | BPF_K, 0, 5, (unsigned long)nr);
+    sc_emit(p, BPF_LD | BPF_W | BPF_ABS, 0, 0, SC_ARG_LO(arg));
+    sc_emit(p, BPF_ALU | BPF_AND | BPF_K, 0, 0, mask);
+    sc_emit(p, BPF_JMP | BPF_JEQ | BPF_K, 0, 1, want);
+    sc_emit(p, BPF_RET | BPF_K, 0, 0, SECCOMP_RET_ALLOW);
+    sc_emit(p, BPF_RET | BPF_K, 0, 0, SECCOMP_RET_KILL_PROCESS);
+}
+
+static int install_seccomp(void)
+{
+    struct sc_prog p;
+    struct sock_fprog prog;
+    unsigned long self = (unsigned long)getpid();
+    size_t i;
+
+    p.n = 0;
+    p.overflow = 0;
+
+    /* A syscall made under another ABI has other numbers: kill it. */
+    sc_emit(&p, BPF_LD | BPF_W | BPF_ABS, 0, 0,
+            offsetof(struct seccomp_data, arch));
+    sc_emit(&p, BPF_JMP | BPF_JEQ | BPF_K, 1, 0, SC_AUDIT_ARCH);
+    sc_emit(&p, BPF_RET | BPF_K, 0, 0, SECCOMP_RET_KILL_PROCESS);
+    sc_emit(&p, BPF_LD | BPF_W | BPF_ABS, 0, 0,
+            offsetof(struct seccomp_data, nr));
+#if defined(__x86_64__)
+    /* x32 shares AUDIT_ARCH_X86_64 and sets bit 30 of the number. */
+    sc_emit(&p, BPF_JMP | BPF_JGE | BPF_K, 0, 1, 0x40000000UL);
+    sc_emit(&p, BPF_RET | BPF_K, 0, 0, SECCOMP_RET_KILL_PROCESS);
+#endif
+
+    for (i = 0; sc_allowed[i] != -1; i++)
+        sc_allow(&p, sc_allowed[i]);
+
+    /* Files are opened read-only, whatever the permissions would allow. */
+    sc_allow_if(&p, __NR_openat, 2, SC_WRITE_FLAGS, O_RDONLY);
+#if defined(__x86_64__)
+    sc_allow_if(&p, __NR_open, 1, SC_WRITE_FLAGS, O_RDONLY);
+#endif
+    /* No memory that is executable, so injected code cannot be run. */
+    sc_allow_if(&p, __NR_mmap, 2, PROT_EXEC, 0);
+    sc_allow_if(&p, __NR_mprotect, 2, PROT_EXEC, 0);
+    /* abort() signals itself (-ftrapv, the stack protector); signals to
+       any other process, the parent included, are refused. */
+    sc_allow_if(&p, __NR_tgkill, 0, 0xffffffffUL, self);
+    sc_allow_if(&p, __NR_tkill, 0, 0xffffffffUL, self);
+
+    sc_emit(&p, BPF_RET | BPF_K, 0, 0, SECCOMP_RET_KILL_PROCESS);
+
+    if (p.overflow) {
+        errno = E2BIG;
+        return -1;
+    }
+    prog.len = p.n;
+    prog.filter = p.insn;
+    /* Set by drop_privileges() already; the filter requires it. */
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0)
+        return -1;
+    return prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog, 0, 0);
+}
+#endif /* PEWTER_HAVE_SECCOMP */
+
 /* Shrink what a child could do if serving its request were ever subverted.
    Runs right after fork, before the first byte from the client is read
    (the TLS handshake included).  A failure here fails closed: the child
@@ -1555,6 +1719,13 @@ static void sandbox_child(void)
        processes, no path lookups except beneath g_rootfd. */
     else if (cap_enter() != 0)
         what = "cap_enter";
+#endif
+#if defined(PEWTER_HAVE_SECCOMP)
+    /* The Linux counterpart: from here on only the system calls a child
+       needs, see install_seccomp().  Last, so that setrlimit itself need
+       not be on the list. */
+    else if (install_seccomp() != 0)
+        what = "seccomp";
 #endif
 
     if (what != NULL) {
@@ -1605,6 +1776,10 @@ static void usage(int status)
           "  -h               this help\n\n"
           "Must be started as root: it chroots into docroot and then drops\n"
           "to the given user before accepting any connection.\n", f);
+#if defined(PEWTER_HAVE_SECCOMP)
+    fputs("Each connection's child runs under a seccomp syscall"
+          " allowlist.\n", f);
+#endif
     exit(status);
 }
 

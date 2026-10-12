@@ -114,6 +114,13 @@ r=$(printf 'GET / HTTP/1.1\r\nX: a\0b\r\n\r\n' | nc -w 3 127.0.0.1 "$PORT" 2>/de
 sleep 1
 kids=$(pgrep -P $SPID | wc -l | tr -d ' ')
 [ "$kids" -ge 1 ] && ok "slowloris child spawned ($kids)" || bad "slowloris child" "$kids"
+# Linux builds with the seccomp filter say so in -h; the child is filtered
+# before it reads the request, so the waiting child must show mode 2.
+kid=$(pgrep -P $SPID | head -1)
+if [ -n "$kid" ] && [ -r /proc/$kid/status ] && "$BIN" -h 2>&1 | grep -q seccomp; then
+  sc=$(awk '/^Seccomp:/ {print $2}' /proc/$kid/status)
+  [ "$sc" = 2 ] && ok "child under seccomp filter" || bad "child seccomp mode" "$sc"
+fi
 sleep 5
 kids=$(pgrep -P $SPID | wc -l | tr -d ' ')
 [ "$kids" = 0 ] && ok "slowloris child reaped after timeout" || bad "slowloris reap" "$kids"
