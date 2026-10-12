@@ -103,6 +103,8 @@
 #define HDR_BUF_SIZE   (ENC_PATH_LEN + 512)    /* response head            */
 #define COPY_BUF_SIZE  65536         /* read/write fallback chunk          */
 #define LOG_TARGET_LEN 256           /* request target as logged           */
+#define LOG_METHOD_LEN 32            /* request method as logged           */
+#define LOG_LINE_LEN   (PATH_MAX + 512) /* one log line, emitted whole     */
 
 static volatile sig_atomic_t g_active_children = 0;
 static volatile sig_atomic_t g_quit = 0;
@@ -147,24 +149,41 @@ static SSL_CTX *g_tls = NULL;   /* NULL unless -C/-K were given */
 static void vlogmsg(const char *fmt, va_list ap) PRINTF_LIKE(1, 0);
 static void logmsg(const char *fmt, ...) PRINTF_LIKE(1, 2);
 static void fatal(const char *fmt, ...) PRINTF_LIKE(1, 2) NORETURN;
+static int write_all(int fd, const char *buf, size_t len);
 
+/* Length of a line after snprintf returned `n` for the space following its
+   first `len` bytes, with `cap` bytes available in all: truncated output
+   counts only what fit, a formatting error adds nothing. */
+static size_t log_append(size_t len, int n, size_t cap)
+{
+    if (n < 0)
+        return len;
+    return (size_t)n < cap - len ? len + (size_t)n : cap - 1;
+}
+
+/* Every child logs to the same stderr.  A line is assembled in full and
+   emitted with one write(2), so lines from concurrent children cannot
+   interleave on a shared pipe; one that does not fit is truncated. */
 static void vlogmsg(const char *fmt, va_list ap)
 {
-    char ts[32];
+    char line[LOG_LINE_LEN];
+    size_t cap = sizeof line - 1;             /* room for the newline */
+    size_t len;
     time_t now;
     struct tm *tm;
-    pid_t pid;
 
     now = time(NULL);
     tm = gmtime(&now);
-    if (tm == NULL || strftime(ts, sizeof ts, "%Y-%m-%dT%H:%M:%SZ", tm) == 0) {
-        ts[0] = '-';
-        ts[1] = '\0';
+    len = tm != NULL ? strftime(line, cap, "%Y-%m-%dT%H:%M:%SZ", tm) : 0;
+    if (len == 0) {
+        line[0] = '-';
+        len = 1;
     }
-    pid = getpid();
-    fprintf(stderr, "%s [%ld] ", ts, (long)pid);
-    vfprintf(stderr, fmt, ap);
-    fputc('\n', stderr);
+    len = log_append(len, snprintf(line + len, cap - len, " [%ld] ",
+                                   (long)getpid()), cap);
+    len = log_append(len, vsnprintf(line + len, cap - len, fmt, ap), cap);
+    line[len++] = '\n';
+    (void)write_all(STDERR_FILENO, line, len);
 }
 
 static void logmsg(const char *fmt, ...)
@@ -1166,6 +1185,7 @@ static void handle_client(int cfd, const struct sockaddr_storage *ss)
     char clean[MAX_PATH_LEN];
     char fspath[MAX_PATH_LEN + 16];
     char safe_target[LOG_TARGET_LEN];
+    char safe_method[LOG_METHOD_LEN];
     const char *method = "-";
     char *target = NULL;
     char *hdrs = NULL;
@@ -1221,7 +1241,10 @@ static void handle_client(int cfd, const struct sockaddr_storage *ss)
             status = 414;
     }
     if (status == 0) {
-        fd = open(fspath, O_RDONLY | O_CLOEXEC);
+        /* O_NONBLOCK so a FIFO in the document root cannot park the child
+           in open() until the alarm fires; it is cleared again below once
+           the file is known to be regular. */
+        fd = open(fspath, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
         if (fd < 0) {
             if (errno == ENOENT || errno == ENOTDIR) {
                 struct stat ds;
@@ -1243,6 +1266,10 @@ static void handle_client(int cfd, const struct sockaddr_storage *ss)
             status = trailing ? 403 : 301;
         } else if (!S_ISREG(st.st_mode)) {
             status = 403;
+        } else {
+            int fl = fcntl(fd, F_GETFL);
+            if (fl >= 0)
+                (void)fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
         }
     }
 
@@ -1289,8 +1316,11 @@ static void handle_client(int cfd, const struct sockaddr_storage *ss)
     drain_input(cfd);
     close(cfd);
 
+    /* The method is whatever token the client sent (a 400/501 logs it
+       raw), so it gets the same treatment as the target. */
+    log_safe(method, safe_method, sizeof safe_method);
     log_safe(target != NULL ? target : "-", safe_target, sizeof safe_target);
-    logmsg("%s \"%s %s\" %d %lu", ip, method, safe_target, status,
+    logmsg("%s \"%s %s\" %d %lu", ip, safe_method, safe_target, status,
            (unsigned long)sent);
 }
 

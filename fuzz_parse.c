@@ -21,6 +21,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     char clean[MAX_PATH_LEN];
     char enc[ENC_PATH_LEN];
     char safe[LOG_TARGET_LEN];
+    char safem[LOG_METHOD_LEN];
     const char *method = "-";
     char *target = NULL;
     char *hdrs = NULL;
@@ -47,6 +48,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         (void)url_encode_path(clean, enc, sizeof enc);
         (void)content_type(clean);
     }
+    log_safe(method, safem, sizeof safem);
     log_safe(target != NULL ? target : "-", safe, sizeof safe);
     return 0;
 }

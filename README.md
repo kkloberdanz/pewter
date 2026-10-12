@@ -275,7 +275,9 @@ Per request, in a forked child:
   or `..` segment, or does not begin with `/`. Segments starting with `.`
   (dotfiles) answer 404. `//` collapses.
   The kernel's chroot is the real boundary; this is defense in depth.
-- Only regular files are served. Directories redirect to the trailing-slash
+- Only regular files are served; the target is opened with `O_NONBLOCK` so a
+  FIFO in the document root cannot stall the child in `open()`. Directories
+  redirect to the trailing-slash
   form and serve `index.html`; a directory without one answers 403. Listings
   are never generated.
 - Every response carries `X-Content-Type-Options: nosniff` so browsers trust
@@ -287,7 +289,9 @@ Per request, in a forked child:
   responding it drains leftover input briefly so the client sees the response
   rather than a TCP reset.
 - Beyond `-c` concurrent children the parent answers 503 inline and closes.
-- Log lines have control characters stripped from the request target.
+- Log lines have control characters stripped from the request method and
+  target, both length-capped, and each line is emitted with a single
+  `write(2)` so concurrent children cannot interleave on a shared pipe.
 - No heap allocation on the request path (the TLS library allocates for its
   own session state); no DNS, `syslog`, or locale after chroot (dates are
   UTC via `gmtime`).
