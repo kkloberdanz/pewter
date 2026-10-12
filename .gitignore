@@ -1,8 +1,8 @@
-pewter
-pewter-debug
+/pewter
+/pewter-debug
 *.o
-pewter-debug.dSYM/
-pewter-fuzz
+/pewter-debug.dSYM/
+/pewter-fuzz
 __pycache__/
 .zig-cache/
 .zig-pkg/

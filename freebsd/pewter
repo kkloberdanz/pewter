@@ -1,0 +1,66 @@
+#!/bin/sh
+#
+# PROVIDE: pewter
+# REQUIRE: NETWORKING
+# KEYWORD: shutdown
+#
+# rc.d script for pewter as an HTTPS server with a Let's Encrypt
+# certificate.  Install as /usr/local/etc/rc.d/pewter, then:
+#
+#   sysrc pewter_enable=YES
+#   sysrc pewter_domain=example.com
+#   service pewter start
+#
+# Optional rc.conf variables (defaults in parentheses):
+#   pewter_docroot   (/usr/local/www/${pewter_domain})
+#   pewter_cert      (${pewter_le}/fullchain.pem)
+#   pewter_key       (${pewter_le}/privkey.pem)
+#   pewter_le        (/usr/local/etc/letsencrypt/live/${pewter_domain})
+#   pewter_args      (-a :: -p 443 -u www -g www)
+#   pewter_logfile   (/var/log/pewter.log)
+#
+# pewter stays in the foreground, so daemon(8) supervises it: it restarts
+# pewter if it exits and writes its stderr to the log file.  The pidfile
+# holds the supervisor's pid, so stop signals daemon, which forwards
+# SIGTERM to pewter and exits instead of restarting it.  SIGHUP to that
+# pid (newsyslog) reopens the log file.  pewter reads the certificate only
+# at startup, so a renewal needs `service pewter restart`; pass that to
+# certbot as --deploy-hook.
+
+. /etc/rc.subr
+
+name=pewter
+rcvar=pewter_enable
+load_rc_config $name
+
+: ${pewter_enable:="NO"}
+: ${pewter_domain:=""}
+: ${pewter_docroot:="/usr/local/www/${pewter_domain}"}
+: ${pewter_le:="/usr/local/etc/letsencrypt/live/${pewter_domain}"}
+: ${pewter_cert:="${pewter_le}/fullchain.pem"}
+: ${pewter_key:="${pewter_le}/privkey.pem"}
+: ${pewter_args:="-a :: -p 443 -u www -g www"}
+: ${pewter_logfile:="/var/log/pewter.log"}
+
+pidfile="/var/run/${name}.pid"
+procname="/usr/sbin/daemon"
+command="/usr/sbin/daemon"
+command_args="-r -P ${pidfile} -o ${pewter_logfile} -t ${name}"
+command_args="${command_args} /usr/local/bin/pewter ${pewter_args}"
+command_args="${command_args} -C ${pewter_cert} -K ${pewter_key}"
+command_args="${command_args} ${pewter_docroot}"
+
+start_precmd="${name}_prestart"
+
+pewter_prestart()
+{
+	if [ -z "${pewter_domain}" ]; then
+		err 1 "pewter_domain is not set; run: sysrc pewter_domain=example.com"
+	fi
+	for f in "${pewter_cert}" "${pewter_key}"; do
+		[ -r "${f}" ] || err 1 "cannot read ${f}"
+	done
+	[ -d "${pewter_docroot}" ] || err 1 "no such directory: ${pewter_docroot}"
+}
+
+run_rc_command "$1"

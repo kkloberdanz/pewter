@@ -139,6 +139,10 @@ request line.
 Send `SIGTERM` or `SIGINT` to stop accepting; in-flight children finish their
 one request and exit.
 
+On FreeBSD, `freebsd/pewter` is an rc.d script that runs pewter as an HTTPS
+service under `daemon(8)` with a certbot certificate; the comment at its
+top lists the `rc.conf` variables.
+
 ## Test
 
     make && sudo sh test.sh
