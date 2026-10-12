@@ -25,7 +25,7 @@ Flag groups are variables you can override:
     make WERROR=                                  # keep warnings non-fatal
     make CC=gcc                                   # another compiler
     make EXTRA=-DPEWTER_NO_SENDFILE               # force the read/write fallback
-    make LDFLAGS="-Wl,-pie,-z,relro,-z,now"       # extra link hardening (Linux/FreeBSD)
+    make LDFLAGS="-pie -Wl,-z,relro,-z,now"       # extra link hardening (Linux/FreeBSD)
 
 `make kcc` is for compilers that know only `-c -S -o -I -D -U -std=`: it
 empties the warning, optimisation, hardening and linker groups and builds

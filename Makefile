@@ -6,7 +6,7 @@
 # Override any group on the command line, e.g.
 #   make WERROR=                      # don't treat warnings as errors
 #   make EXTRA=-DPEWTER_NO_SENDFILE   # force the read/write fallback
-#   make LDFLAGS="-Wl,-pie,-z,relro,-z,now"   # extra hardening on Linux/FreeBSD
+#   make LDFLAGS="-pie -Wl,-z,relro,-z,now"   # extra hardening on Linux/FreeBSD
 #
 # `make tls` builds the same `pewter` binary with HTTPS support.  It needs
 # OpenSSL or LibreSSL headers and libraries; the recipe asks pkg-config
@@ -39,7 +39,17 @@ HARDEN   = -fstack-protector-strong -D_FORTIFY_SOURCE=2 -fPIE -ftrapv \
            -fno-strict-aliasing -fno-delete-null-pointer-checks
 EXTRA    =
 CFLAGS   = $(STD) $(WARN) $(WERROR) $(OPT) $(HARDEN) $(EXTRA)
-LDFLAGS  = -Wl,-pie
+LDFLAGS  = $(PIE)
+
+# Link as PIE.  This must be the driver flag -pie, not -Wl,-pie: only the
+# driver knows to switch to the PIE startup files (Scrt1.o, crtbeginS.o),
+# and FreeBSD's cc does not default to PIE.  Apple clang rejects -pie as
+# unused (every Darwin executable is PIE), so like TLS_INC this is a shell
+# substitution run by the recipe: it emits -pie only if the compiler links
+# a trivial program with it under -Werror.
+PIE      = $$(d=$$(mktemp -d) && printf 'int main(void){return 0;}\n' >"$$d/p.c" \
+           && $(CC) -fPIE -pie -Werror -o "$$d/p" "$$d/p.c" >/dev/null 2>&1 \
+           && echo -pie; rm -rf "$$d")
 
 DEBUG_OPT    = -O0 -g3
 DEBUG_HARDEN = -fsanitize=address,undefined -fno-omit-frame-pointer
